@@ -1,0 +1,76 @@
+# Deploys the static front-end to GitHub Pages on every push to main. There is no build step.
+#
+# config.js is WRITTEN HERE, not committed. It is gitignored on purpose: it holds this deployment's project
+# URL and anon key, and keeping it out of the repository means the same code can point at a different
+# Supabase project (a test project, a replacement after a rebuild) by changing two repository secrets
+# instead of editing a tracked file. The values are public once deployed (every browser downloads them), and
+# that is safe only because row level security refuses an unauthenticated caller. The service_role key must
+# never be used here.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   SUPABASE_URL, SUPABASE_ANON_KEY
+#
+# The school's own name is NOT one of them: the sign-in dialog asks the project for it through
+# f_public_brand(), so it is set once in ตั้งค่า and never here.
+#
+# One-time repository setting: Settings > Pages > Source = "GitHub Actions".
+#
+# WHERE THIS RUNS  In the public SITE repository, whose root holds index.html, assets/ and these workflows and
+# nothing else. It is a copy of the front-end, pushed from waste_bank_web; the project repository it is copied
+# from - db/, tests/, docs/, backup/ - is never published, because free Pages requires a public repository and
+# backup/ would hold CSV copies of the school's records. docs/INSTALL.md section 10 sets both repositories up.
+#
+# Only what the browser needs is published: index.html, assets/, and the config.js written below.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push supersedes a queued one but never cancels one in progress.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Write config.js from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          for v in SUPABASE_URL SUPABASE_ANON_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::repository secret $v is not set"; exit 1; fi
+          done
+          # JSON.stringify gives a correctly escaped JavaScript string literal (Thai text, quotes).
+          node -e '
+            const q = (k) => "export const " + k + " = " + JSON.stringify(process.env[k]) + ";\n";
+            process.stdout.write(["SUPABASE_URL", "SUPABASE_ANON_KEY"].map(q).join(""));
+          ' > config.js
+
+      - name: Stage the files the browser needs
+        run: |
+          mkdir _site
+          cp -r index.html assets config.js _site/
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

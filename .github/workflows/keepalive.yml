@@ -1,0 +1,73 @@
+# One API request a day, so the Supabase free tier does not pause the school's project.
+#
+# WHY IT EXISTS  A free-tier project with no API requests for about a week is paused, and a paused project
+# answers nothing: the app can only say "เชื่อมต่อเซิร์ฟเวอร์ไม่ได้", and someone with dashboard access has to
+# restore it by hand. During term that never happens, because teachers use the app every week. A term break
+# is longer than a week, which is exactly when nobody is watching. This job is the heartbeat that carries the
+# project across the break.
+#
+# A FAILED RUN IS THE ALARM, like the backup job's. If this turns red, the project is paused, the keys have
+# changed, or Supabase is down - open the dashboard and look. Do not make the job tolerate a bad answer.
+#
+# WHERE IT RUNS  In the public SITE repository, beside pages.yml, on the two secrets Pages already holds. It
+# needs nothing else from the repository: no checkout, no database password, no service key.
+#
+# WHAT IT SENDS  Two requests to the project's own public API with the publishable anon key, which is already
+# served to every browser that loads the app (config.js). It reads NO school data: /auth/v1/health answers
+# with the auth service's version, and the PostgREST request is there because waking the API is not the same
+# as waking Postgres - anon holds no grant on any table (db/deploy/005_policies.sql), so a 401 or 403 is the
+# right answer and still proves the database answered. Anything else, including a timeout, is a failure.
+#
+# WHAT IT IS NOT  It is not a backup and it is not a substitute for one (.github/workflows/backup.yml,
+# docs/INSTALL.md section 11). It also cannot stop GitHub from disabling a schedule: GitHub switches off
+# scheduled workflows in a repository with no commits for 60 days, and then this job stops silently. If the
+# repository goes quiet for a term, check the Actions tab when you come back - or push any commit, which
+# re-enables it.
+name: Keep the project awake
+
+on:
+  schedule:
+    - cron: '23 2 * * *' # daily 02:23 UTC (09:23 in Bangkok)
+  workflow_dispatch:
+
+permissions: {} # it needs nothing from the repository: no checkout, no commit
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the project whether it is awake
+        env:
+          URL: ${{ secrets.SUPABASE_URL }}
+          KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -u
+          if [ -z "${URL:-}" ]; then echo "::error::repository secret SUPABASE_URL is not set"; exit 1; fi
+          if [ -z "${KEY:-}" ]; then echo "::error::repository secret SUPABASE_ANON_KEY is not set"; exit 1; fi
+          base="${URL%/}"
+          # curl prints 000 itself when it never got an answer, and says why on stderr; `|| true` only keeps
+          # that non-zero exit from ending the step before both requests have been made.
+          ask() { curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -H "apikey: $KEY" "$1" || true; }
+          auth=$(ask "$base/auth/v1/health")
+          rest=$(ask "$base/rest/v1/waste_type?select=id&limit=1")
+          echo "auth/v1/health -> $auth"
+          echo "rest/v1 (anon, expected 401 or 403) -> $rest"
+          fail=0
+          case "$auth" in 200) ;; *) echo "::error::the auth API answered $auth, not 200"; fail=1 ;; esac
+          # 200 would mean anon can read a table, which 005_policies.sql forbids; it is still proof of life,
+          # but it is worth knowing about, so it is a warning rather than a pass.
+          case "$rest" in
+            401|403) ;;
+            200) echo "::warning::the anon key could read waste_type - check db/deploy/005_policies.sql" ;;
+            *) echo "::error::PostgREST answered $rest; the database did not respond normally"; fail=1 ;;
+          esac
+          if [ "$fail" = "1" ]; then
+            echo "::error::The project looks paused or unreachable. Open the Supabase dashboard and restore it (docs/INSTALL.md section 11)."
+            exit 1
+          fi
+          echo "the project is awake"
